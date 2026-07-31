@@ -10,7 +10,7 @@ import pytest
 
 from vouch import capabilities, health, synthesize
 from vouch.jsonl_server import HANDLERS, handle_request
-from vouch.models import Claim, ClaimStatus, Page, PageStatus
+from vouch.models import Claim, ClaimStatus, Page, PageStatus, ProposalStatus
 from vouch.storage import KBStore
 
 _CITE = re.compile(r"\[([^\[\]]+)\]")
@@ -206,3 +206,99 @@ def test_jsonl_synthesize_handler(store: KBStore, monkeypatch) -> None:
     assert set(resp["result"]["claims"]) <= set(ids)
     for cid in resp["result"]["claims"]:
         assert f"[{cid}]" in resp["result"]["answer"]
+
+
+# --- file_as_page ------------------------------------------------------------
+
+
+def test_file_as_page_files_a_pending_proposal(store: KBStore) -> None:
+    ids = _auth_kb(store)
+    result = synthesize.synthesize(
+        store, query="auth tokens", depth=5,
+        file_as_page=True, proposed_by="agent-x",
+    )
+    assert result["page_proposal_id"] is not None
+    assert result["page_proposal_skipped_reason"] is None
+
+    pending = [p for p in store.list_proposals() if p.status == ProposalStatus.PENDING]
+    assert len(pending) == 1
+    proposal = pending[0]
+    assert proposal.id == result["page_proposal_id"]
+    assert proposal.proposed_by == "agent-x"
+    assert set(proposal.payload["claims"]) == set(result["claims"])
+    assert set(proposal.payload["claims"]) <= set(ids)
+    assert result["answer"] in proposal.payload["body"]
+    # never approved — still behind the review gate like every other write
+    assert proposal.status == ProposalStatus.PENDING
+
+
+def test_file_as_page_uses_custom_title(store: KBStore) -> None:
+    _auth_kb(store)
+    result = synthesize.synthesize(
+        store, query="auth tokens", depth=5,
+        file_as_page=True, proposed_by="agent-x", page_title="Auth Q&A",
+    )
+    proposal = store.get_proposal(result["page_proposal_id"])
+    assert proposal.payload["title"] == "Auth Q&A"
+
+
+def test_file_as_page_skipped_when_answer_is_empty(store: KBStore) -> None:
+    _auth_kb(store)
+    result = synthesize.synthesize(
+        store, query="kubernetes networking topology",
+        file_as_page=True, proposed_by="agent-x",
+    )
+    assert result["answer"] == ""
+    assert result["page_proposal_id"] is None
+    assert "uncited" in result["page_proposal_skipped_reason"] or "empty" in (
+        result["page_proposal_skipped_reason"] or ""
+    )
+    assert store.list_proposals() == []
+
+
+def test_file_as_page_without_proposed_by_raises(store: KBStore) -> None:
+    _auth_kb(store)
+    with pytest.raises(ValueError, match="proposed_by"):
+        synthesize.synthesize(store, query="auth", file_as_page=True)
+
+
+def test_file_as_page_defaults_to_false(store: KBStore) -> None:
+    """The existing no-arg call shape must keep working exactly as before —
+    file_as_page defaults off and the result carries no proposal keys."""
+    _auth_kb(store)
+    result = synthesize.synthesize(store, query="auth", depth=5)
+    assert "page_proposal_id" not in result
+    assert "page_proposal_skipped_reason" not in result
+    assert store.list_proposals() == []
+
+
+def test_jsonl_synthesize_file_as_page(store: KBStore, monkeypatch) -> None:
+    _auth_kb(store)
+    monkeypatch.chdir(store.root)
+    resp = handle_request({
+        "id": "s3", "method": "kb.synthesize",
+        "params": {"query": "auth tokens", "depth": 5, "file_as_page": True},
+    })
+    assert resp["ok"]
+    assert resp["result"]["page_proposal_id"] is not None
+    pending = [p for p in store.list_proposals() if p.status == ProposalStatus.PENDING]
+    assert len(pending) == 1
+
+
+def test_cli_synthesize_file_as_page(store: KBStore, monkeypatch, tmp_path: Path) -> None:
+    from click.testing import CliRunner
+
+    from vouch.cli import cli
+
+    _auth_kb(store)
+    monkeypatch.chdir(store.root)
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["synthesize", "auth tokens", "--depth", "5", "--file-as-page",
+              "--agent", "cli-tester"],
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["page_proposal_id"] is not None
+    proposal = store.get_proposal(payload["page_proposal_id"])
+    assert proposal.proposed_by == "cli-tester"
