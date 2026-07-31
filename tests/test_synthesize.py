@@ -232,6 +232,46 @@ def test_file_as_page_files_a_pending_proposal(store: KBStore) -> None:
     assert proposal.status == ProposalStatus.PENDING
 
 
+def test_file_as_page_body_includes_gaps_section(store: KBStore) -> None:
+    """A partially-covered query (some cited claims, some uncovered terms)
+    must carry its gaps into the filed page body, not just the result dict."""
+    _auth_kb(store)
+    result = synthesize.synthesize(
+        store, query="auth billing invoices", depth=5,
+        file_as_page=True, proposed_by="agent-x",
+    )
+    assert result["answer"] != ""
+    assert result["gaps"]
+    proposal = store.get_proposal(result["page_proposal_id"])
+    assert "## Gaps" in proposal.payload["body"]
+    for gap in result["gaps"]:
+        assert f"- {gap}" in proposal.payload["body"]
+
+
+def test_file_as_page_reports_propose_page_failure(
+    store: KBStore, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A propose_page failure (e.g. an invalid page kind) must degrade to a
+    reported skip reason rather than losing the already-successful
+    synthesis — the answer computation and the filing step fail independently."""
+    from vouch import synthesize as synth_mod
+    from vouch.proposals import ProposalError
+
+    def _boom(*args, **kwargs):
+        raise ProposalError("simulated propose_page failure")
+
+    monkeypatch.setattr(synth_mod, "propose_page", _boom)
+    _auth_kb(store)
+    result = synth_mod.synthesize(
+        store, query="auth tokens", depth=5,
+        file_as_page=True, proposed_by="agent-x",
+    )
+    assert result["answer"] != ""  # synthesis itself still succeeded
+    assert result["page_proposal_id"] is None
+    assert result["page_proposal_skipped_reason"] == "simulated propose_page failure"
+    assert store.list_proposals() == []
+
+
 def test_file_as_page_uses_custom_title(store: KBStore) -> None:
     _auth_kb(store)
     result = synthesize.synthesize(
