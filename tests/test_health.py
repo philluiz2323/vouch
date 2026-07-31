@@ -474,6 +474,20 @@ def test_jsonl_fsck_surfaces_findings_not_just_ok_flag(
     assert "index_orphan_claim" in codes
 
 
+def test_mcp_surface_serves_fsck(store: KBStore, monkeypatch) -> None:
+    from vouch import server
+
+    src = store.put_source(b"e")
+    store.put_claim(Claim(id="c1", text="t", evidence=[src.id]))
+    monkeypatch.setattr(server, "_store", lambda: store)
+
+    result = server.kb_fsck()
+    direct = health.fsck(store)
+    assert result["ok"] == direct.ok
+    assert {f["code"] for f in result["findings"]} == {f.code for f in direct.findings}
+    assert result["counts"]["claims"] == direct.counts["claims"]
+
+
 def test_cli_fsck_registered_as_kb_fsck_method() -> None:
     """kb.fsck's default CLI mirror rule (kb.foo -> vouch foo) must resolve
     to the pre-existing `fsck` command rather than needing a new one — this
